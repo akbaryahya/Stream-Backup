@@ -6,7 +6,7 @@ const args = minimist(process.argv.slice(2));
 
 // Set environment variables based on command-line arguments
 const RTSP_STREAM_URL = args.RTSP_STREAM_URL || 'rtsp://0.0.0.0/user=xxx_password=xxx_channel=0_stream=0&onvif=1.sdp?real_stream';
-const BACKUP_VIDEO_FILE = args.BACKUP_VIDEO_FILE || 'offline.mp4';
+const BACKUP_VIDEO_FILE = args.BACKUP_VIDEO_FILE || 'offline.jpg';
 const STREAM_URL = args.STREAM_URL || 'rtmp://a.rtmp.youtube.com/live2/xxxx';
 
 const RESOLUTION = args.RESOLUTION || '1280:720';
@@ -29,8 +29,12 @@ let ffCheck = null;
 // Function to start the stream
 function startStream(source, loop = false) {
 
-    if (currentFF) currentFF.kill(`SIGINT`)
+    if (currentFF) currentFF.kill('SIGINT');
+
+    const isImage = source.endsWith('.jpg'); // Check if the source is an image
+
     currentFF = ffmpeg(source)
+        .inputOptions(isImage ? ['-loop 1'] : loop ? ['-stream_loop -1'] : []) // Loop image or video
         .videoCodec('libx264')
         .outputOptions([
             '-preset veryfast', // Use faster preset
@@ -40,16 +44,20 @@ function startStream(source, loop = false) {
             '-f flv', // Output format for YouTube
             '-fflags', 'nobuffer', // Reduce latency
             '-rtsp_transport', 'tcp', // Use TCP for RTSP
-            //'-rtbufsize', '10M', // Larger buffer for RTSP
-            '-rw_timeout', '2000000',
+            '-rtbufsize', '10M', // Larger buffer for RTSP
+            '-rw_timeout', '2000000', // Set timeout
             //'-stimeout', '2000000',
             //'-timeout', '2',
-            '-r', '10', // Frame rate to 10 FPS for stability
+            '-r', '10' // Frame rate to 10 FPS for stability
         ])
-        .videoFilter('scale='+RESOLUTION)
+        .videoFilter('scale=' + RESOLUTION) // Scale the video to the desired resolution
+        .outputOptions(isImage ? [
+            '-filter_complex', 'anullsrc=r=44100:cl=stereo', // Generate silent audio for image stream
+            '-shortest' // Ensure audio and video are the same length
+        ] : []) // Only apply silent audio filter if it's an image
         .output(STREAM_URL)
         .on('start', (commandLine) => {
-            console.log(`Streaming main started with source: ${source} > ${commandLine}`);
+            console.log(`Streaming started with source: ${source} > ${commandLine}`);
             currentSource = source;
         })
         .on('stderr', (i) => {
@@ -58,17 +66,12 @@ function startStream(source, loop = false) {
         })
         .on('error', (i) => {
             console.error(`Stream main error with source ${currentSource}: ${i.message}`);
-            stderrLine = i.message
+            stderrLine = i.message;
         })
         .on('end', () => {
             console.log(`Stream main ended for source: ${currentSource}`);
-            stderrLine = `end`
+            stderrLine = 'end';
         });
-
-    // Loop video
-    if (loop) {
-        currentFF.inputOptions(['-stream_loop -1']);
-    }
 
     currentFF.run();
 }
@@ -134,10 +137,10 @@ function checkMainStream() {
                     '-rw_timeout', '2000000',
                     //'-stimeout', '2000000',
                     //'-timeout', '2',
-                    '-r', '1', // Frame rate to 10 FPS for stability
+                    '-r', '1' // Frame rate to 10 FPS for stability
                 ])
                 .inputOptions('-t 1') // Short stream
-                .videoFilter('scale='+RESOLUTION)
+                .videoFilter('scale=' + RESOLUTION)
                 .output(STREAM_URL)
                 .on('start', () => {
                     console.log('RTSP backup check live....');
