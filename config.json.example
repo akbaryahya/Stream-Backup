@@ -1,0 +1,14 @@
+{
+    "camera": [
+        {
+            "nameStream": "CAM1",
+            "rtspUrl": "rtsp://1.0.0.1/user=xxx_password=xxx_channel=0_stream=1",
+            "streamUrl": "rtmp://a.rtmp.youtube.com/live2/xxx"
+        },
+        {
+            "nameStream": "CAM2",
+            "rtspUrl": "rtsp://1.0.0.2/user=xxx_password=xxx_channel=0_stream=1",
+            "streamUrl": "rtmp://a.rtmp.youtube.com/live2/xxx"
+        }
+    ]
+}

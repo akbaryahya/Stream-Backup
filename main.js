@@ -1,214 +1,240 @@
-const minimist = require('minimist');
-const ffmpeg = require('fluent-ffmpeg');
+const minimist = require("minimist")
+const ffmpeg = require("fluent-ffmpeg")
+const fs = require("fs")
 
-// Parse command line arguments
-const args = minimist(process.argv.slice(2));
+const args = minimist(process.argv.slice(2))
 
-// Set environment variables based on command-line arguments
-const RTSP_STREAM_URL = args.RTSP_STREAM_URL || 'rtsp://0.0.0.0/user=xxx_password=xxx_channel=0_stream=0&onvif=1.sdp?real_stream';
-const BACKUP_VIDEO_FILE = args.BACKUP_VIDEO_FILE || 'offline.jpg';
-const STREAM_URL = args.STREAM_URL || 'rtmp://a.rtmp.youtube.com/live2/xxxx';
+class StreamMonitor {
+	constructor({
+		nameStream,
+		rtspUrl,
+		streamUrl,
+		backupUrl = "offline.mp4",
+		resolution = "1280:720",
+		stuckThreshold = 5,
+		checkInterval = 3
+	}) {
+		this.nameStream = nameStream
+		this.rtspUrl = rtspUrl
+		this.backupUrl = backupUrl
+		this.streamUrl = streamUrl
+		this.resolution = resolution
+		this.stuckThreshold = stuckThreshold
+		this.checkInterval = checkInterval
 
-const RESOLUTION = args.RESOLUTION || '1280:720';
+		this.lastFrameTime = Date.now()
+		this.lastStreamTime = null
+		this.isStreamStuck = false
+		this.currentSource = null
+		this.checkMainStreamInterval = null
+		//this.checkStreamInterval = null
+		this.stderrLine = ""
+		this.currentFF = null
+		this.ffCheck = null
 
-console.log(`URL RTSP: ${RTSP_STREAM_URL}`)
-console.log(`URL STREAM: ${STREAM_URL}`)
+		this.init()
+	}
 
-let lastFrameTime = Date.now();
-let lastStreamTime = null;  // Last reported time from FFmpeg
-let stuckThreshold = 5; // Time threshold for stuck stream.
-let nextCheck = 3; // Time threshold for wait next check stream.
-let isStreamStuck = false;  // Flag to track stuck state
-let currentSource = null;
-let checkMainStreamInterval = null; // Interval to check if RTSP is back
-//let checkStreamInterval = null;
-let stderrLine = ""
-let currentFF = null;
-let ffCheck = null;
+	init() {
+		this.startStream(this.rtspUrl)
+		this.monitorStream()
+	}
 
-// Function to start the stream
-function startStream(source, loop = false) {
+	startStream(source, loop = false) {
+		if (this.currentFF) this.currentFF.kill("SIGINT")
 
-    if (currentFF) currentFF.kill('SIGINT');
+		const isImage = source.endsWith(".jpg")
+		this.currentFF = ffmpeg(source)
+			.inputOptions(isImage ? ["-loop 1"] : loop ? ["-stream_loop -1"] : [])
+			.videoCodec("libx264")
+			.outputOptions([
+				"-preset veryfast",
+				"-c:a aac",
+				"-ar 44100",
+				"-b:a 128k",
+				"-f flv",
+				"-fflags",
+				"nobuffer",
+				"-rtsp_transport",
+				"tcp",
+				"-rtbufsize",
+				"10M",
+				"-rw_timeout",
+				"2000000",
+				"-r",
+				"10"
+			])
+			.videoFilter("scale=" + this.resolution)
+			.outputOptions(isImage ? ["-filter_complex", "anullsrc=r=44100:cl=stereo", "-shortest"] : [])
+			.output(this.streamUrl)
+			.on("start", (commandLine) => {
+				console.log(`Streaming ${this.nameStream} started with source: ${source} > ${commandLine}`)
+				this.currentSource = source
+			})
+			.on("stderr", (i) => {
+				this.stderrLine = i
+			})
+			.on("error", (i) => {
+				console.error(`Stream main ${this.nameStream} is error with source ${this.currentSource}: ${i.message}`)
+				this.stderrLine = i.message
+			})
+			.on("end", () => {
+				console.log(`Stream main ${this.nameStream} is ended for source ${this.currentSource}`)
+				this.stderrLine = "end"
+			})
 
-    const isImage = source.endsWith('.jpg'); // Check if the source is an image
+		this.currentFF.run()
+	}
 
-    currentFF = ffmpeg(source)
-        .inputOptions(isImage ? ['-loop 1'] : loop ? ['-stream_loop -1'] : []) // Loop image or video
-        .videoCodec('libx264')
-        .outputOptions([
-            '-preset veryfast', // Use faster preset
-            '-c:a aac', // Audio codec for YouTube
-            '-ar 44100',// Set audio sample rate
-            '-b:a 128k',// Set audio bitrate
-            '-f flv', // Output format for YouTube
-            '-fflags', 'nobuffer', // Reduce latency
-            '-rtsp_transport', 'tcp', // Use TCP for RTSP
-            '-rtbufsize', '10M', // Larger buffer for RTSP
-            '-rw_timeout', '2000000', // Set timeout
-            //'-stimeout', '2000000',
-            //'-timeout', '2',
-            '-r', '10' // Frame rate to 10 FPS for stability
-        ])
-        .videoFilter('scale=' + RESOLUTION) // Scale the video to the desired resolution
-        .outputOptions(isImage ? [
-            '-filter_complex', 'anullsrc=r=44100:cl=stereo', // Generate silent audio for image stream
-            '-shortest' // Ensure audio and video are the same length
-        ] : []) // Only apply silent audio filter if it's an image
-        .output(STREAM_URL)
-        .on('start', (commandLine) => {
-            console.log(`Streaming started with source: ${source} > ${commandLine}`);
-            currentSource = source;
-        })
-        .on('stderr', (i) => {
-            //console.error(`FFmpeg stderr: ${i}`);
-            stderrLine = i
-        })
-        .on('error', (i) => {
-            console.error(`Stream main error with source ${currentSource}: ${i.message}`);
-            stderrLine = i.message;
-        })
-        .on('end', () => {
-            console.log(`Stream main ended for source: ${currentSource}`);
-            stderrLine = 'end';
-        });
+	monitorStream() {
+		setInterval(() => {
+			this.checkIfStreamIsStuck()
+		}, 1000)
+	}
 
-    currentFF.run();
+	checkIfStreamIsStuck() {
+		let weNeedCheck = false
+		const timeMatch = this.stderrLine.match(/time=\s*([\d:.]+)/)
+		if (timeMatch) {
+			const currentTime = timeMatch[1]
+			const currentMillis = this.timeToMillis(currentTime)
+			if (this.lastStreamTime && currentMillis === this.lastStreamTime) {
+				if (!this.isStreamStuck && Date.now() - this.lastFrameTime > 1000 * this.stuckThreshold) {
+					console.log(`Stream ${this.nameStream} is stuck. Switching to backup.`)
+					this.isStreamStuck = true
+					this.startStream(this.backupUrl, true)
+				}
+			} else {
+				this.lastStreamTime = currentMillis
+				this.lastFrameTime = Date.now()
+				if (this.currentSource === this.rtspUrl) {
+					console.log(`LIVE ${this.nameStream}: ${this.stderrLine}`)
+					this.isStreamStuck = false
+				} else {
+					console.error(`OFFLINE ${this.nameStream}: ${this.stderrLine}`)
+					weNeedCheck = true
+				}
+			}
+		} else {
+			console.error(`NoTime${this.nameStream}: ${this.stderrLine}`)
+			if (this.stderrLine.includes(`ffmpeg exited`)) {
+				weNeedCheck = true
+			}
+		}
+
+		if (weNeedCheck) {
+			this.checkMainStream()
+		}
+	}
+
+	checkMainStream() {
+		if (!this.checkMainStreamInterval) {
+			this.checkMainStreamInterval = setTimeout(() => {
+				console.log(`Checking if stream ${this.nameStream} is live?`)
+
+				if (this.ffCheck) this.ffCheck.kill("SIGINT")
+				this.ffCheck = ffmpeg(this.rtspUrl)
+					.videoCodec("libx264")
+					.outputOptions([
+						"-preset veryfast",
+						"-c:a aac",
+						"-ar 44100",
+						"-b:a 128k",
+						"-f flv",
+						"-rw_timeout",
+						"2000000",
+						"-r",
+						"1"
+					])
+					.inputOptions("-t 1")
+					.videoFilter("scale=" + this.resolution)
+					.output(this.streamUrl)
+					.on("start", () => {
+						console.log(`Check stream ${this.nameStream} start !`)
+					})
+					.on("stderr", (i) => {
+						console.log(`stderr ${this.nameStream}: ${i}`)
+						const timeMatch = i.match(/time=\s*([\d:.]+)/)
+						if (timeMatch) {
+							if (this.ffCheck) this.ffCheck.kill("SIGINT")
+							this.isStreamStuck = false
+							this.startStream(this.rtspUrl)
+							console.log(`Stream ${this.nameStream} main is back live`)
+						}
+
+						// Timeout wait load
+						//if(this.checkStreamInterval) clearInterval(this.checkStreamInterval)
+						//this.checkStreamInterval = setTimeout(() => {
+						//clearInterval(checkMainStreamInterval);
+						//checkMainStreamInterval = null;
+						//}, 1000 * 2);
+					})
+					.on("error", (i) => {
+						console.error(`Stream backup error: ${i.message}`)
+						clearInterval(this.checkMainStreamInterval)
+						this.checkMainStreamInterval = null
+						if (!i.message.includes("killed")) {
+							console.log(`Stream ${this.nameStream} for ${this.rtspUrl} not available yet: `, i)
+							this.isStreamStuck = true
+						}
+					})
+					.on("end", () => {
+						console.log(`Streaming check for ${this.nameStream} > backup ended`)
+						clearInterval(this.checkMainStreamInterval)
+						this.checkMainStreamInterval = null
+					})
+					.run()
+			}, 1000 * this.checkInterval)
+		}
+	}
+
+	timeToMillis(timeString) {
+		const timeParts = timeString.split(":")
+		let millis = 0
+		if (timeParts.length === 3) {
+			millis += parseInt(timeParts[0]) * 3600000
+			millis += parseInt(timeParts[1]) * 60000
+			millis += parseFloat(timeParts[2]) * 1000
+		} else if (timeParts.length === 2) {
+			millis += parseInt(timeParts[0]) * 60000
+			millis += parseFloat(timeParts[1]) * 1000
+		}
+		return millis
+	}
 }
 
-// Function to monitor the stream and detect if it's stuck
-function checkIfStreamIsStuck() {
-    // Parse the time data from stderr output
-    let weNeedCheck = false
-    const timeMatch = stderrLine.match(/time=\s*([\d:.]+)/);
-    if (timeMatch) {
-        const currentTime = timeMatch[1];
-        const currentMillis = timeToMillis(currentTime);
-        if (lastStreamTime && currentMillis === lastStreamTime) {
-            // If the time hasn't changed, it's stuck
-            console.log(`Stream appears to be stuck at time: ${currentTime}`);
-            if (!isStreamStuck && Date.now() - lastFrameTime > (1000 * stuckThreshold)) {
-                // If the stream has been stuck for more than the threshold, switch to backup
-                console.log('Stream is stuck for too long. Switching to backup.');
-                isStreamStuck = true;
-                startStream(BACKUP_VIDEO_FILE, true);
-            }
-        } else {
-            // If time is progressing, update last time
-            lastStreamTime = currentMillis;
-            lastFrameTime = Date.now();
-            if (currentSource == RTSP_STREAM_URL) {
-                console.log("LIVE: " + stderrLine)
-                //if (ffCheck) ffCheck.kill('SIGINT');
-                isStreamStuck = false;
-            } else {
-                console.error("OFFLINE: " + stderrLine)
-                weNeedCheck = true
-            }
-        }
-    } else {
-        console.error(`NoTime:${currentSource}` + stderrLine)
-        //weNeedCheck = true
-    }
+// Helper function to parse command-line arguments
+function loadStreamsFromArgsOrConfig() {
+	const streams = []
 
-    if (weNeedCheck) {
-        //console.log(`stream stuck......`)
-        checkMainStream();
-    }
+	// Parse arguments for streams in the form of STREAM1_nameStream, STREAM1_rtspUrl, STREAM1_streamUrl, etc.
+	Object.keys(args).forEach((key) => {
+		const match = key.match(/STREAM(\d+)_(.+)/)
+		if (match) {
+			const [, streamNumber, property] = match
+			const index = parseInt(streamNumber) - 1
+
+			if (!streams[index]) streams[index] = {}
+			streams[index][property] = args[key]
+		}
+	})
+
+	// If no valid streams from arguments, load config.json
+	if (streams.length === 0 || !streams[0].nameStream) {
+		try {
+			const config = JSON.parse(fs.readFileSync("config.json"))
+			return config.camera
+		} catch (err) {
+			console.error("Error reading config.json:", err)
+			process.exit(1)
+		}
+	}
+
+	return streams
 }
 
-// Function to check if RTSP stream is live again
-function checkMainStream() {
-    if (!checkMainStreamInterval) {
-        // Try to restart RTSP stream
-        checkMainStreamInterval = setTimeout(() => {
-            console.log('Checking if RTSP stream is live...');
-
-            if (ffCheck) ffCheck.kill('SIGINT');
-            ffCheck = ffmpeg(RTSP_STREAM_URL)
-                .videoCodec('libx264')
-                .outputOptions([
-                    '-preset veryfast', // Use faster preset
-                    '-c:a aac', // Audio codec for YouTube
-                    '-ar 44100',// Set audio sample rate
-                    '-b:a 128k',// Set audio bitrate
-                    '-f flv', // Output format for YouTube
-                    '-rtsp_transport', 'tcp', // Use TCP for RTSP
-                    '-rw_timeout', '2000000',
-                    //'-stimeout', '2000000',
-                    //'-timeout', '2',
-                    '-r', '1' // Frame rate to 10 FPS for stability
-                ])
-                .inputOptions('-t 1') // Short stream
-                .videoFilter('scale=' + RESOLUTION)
-                .output(STREAM_URL)
-                .on('start', () => {
-                    console.log('RTSP backup check live....');
-                })
-                .on('stderr', (i) => {
-                    console.log(`FFmpeg backup stderr: ${i}`);
-                    const timeMatch = i.match(/time=\s*([\d:.]+)/); //i.includes(`Input #0`)
-                    if (timeMatch) {
-                        // kill it
-                        if (ffCheck) ffCheck.kill('SIGINT');
-                        // RTSP is live, switch back from backup                        
-                        isStreamStuck = false;
-                        // start back
-                        startStream(RTSP_STREAM_URL);
-                        console.log('RTSP main back live....');
-                    }
-
-                    // Timeout wait load
-                    //if(checkStreamInterval) clearInterval(checkStreamInterval)
-                    //checkStreamInterval = setTimeout(() => {
-                    //clearInterval(checkMainStreamInterval);
-                    //checkMainStreamInterval = null;
-                    //}, 1000 * 2);
-
-                })
-                .on('error', (i) => {
-                    console.error(`Stream backup error: ${i.message}`);
-
-                    clearInterval(checkMainStreamInterval);
-                    checkMainStreamInterval = null;
-
-                    if (!(i.message).includes(`killed`)) {
-                        console.log(`RTSP stream ${RTSP_STREAM_URL} not available yet: `, i);
-                        isStreamStuck = true;
-                    }
-
-                })
-                .on('end', () => {
-                    console.log(`Streaming backup ended`);
-
-                    clearInterval(checkMainStreamInterval);
-                    checkMainStreamInterval = null;
-                })
-                .run();
-
-        }, 1000 * nextCheck);
-    }
-}
-
-// Helper function to convert FFmpeg time format to milliseconds
-function timeToMillis(timeString) {
-    const timeParts = timeString.split(':');
-    let millis = 0;
-    if (timeParts.length === 3) {
-        millis += parseInt(timeParts[0]) * 3600000; // hours to ms
-        millis += parseInt(timeParts[1]) * 60000;   // minutes to ms
-        millis += parseFloat(timeParts[2]) * 1000;  // seconds to ms
-    } else if (timeParts.length === 2) {
-        millis += parseInt(timeParts[0]) * 60000;   // minutes to ms
-        millis += parseFloat(timeParts[1]) * 1000;  // seconds to ms
-    }
-    return millis;
-}
-
-// Start stream with RTSP source
-startStream(RTSP_STREAM_URL);
-
-// Loop check
-setInterval(() => {
-    checkIfStreamIsStuck()
-}, 1000);
+// Load streams and start monitoring
+const streams = loadStreamsFromArgsOrConfig()
+streams.forEach((stream) => {
+	new StreamMonitor(stream)
+})
