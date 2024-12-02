@@ -93,7 +93,6 @@ class StreamMonitor {
 	}
 
 	checkIfStreamIsStuck() {
-		let weNeedCheck = false
 		const timeMatch = this.stderrLine.match(/time=\s*([\d:.]+)/)
 		if (timeMatch) {
 			const currentTime = timeMatch[1]
@@ -105,24 +104,26 @@ class StreamMonitor {
 					this.startStream(this.backupUrl, true)
 				}
 			} else {
-				this.lastStreamTime = currentMillis
-				this.lastFrameTime = Date.now()
 				if (this.currentSource === this.rtspUrl) {
+					this.lastStreamTime = currentMillis
+					this.lastFrameTime = Date.now()
+
 					console.log(`LIVE ${this.nameStream}: ${this.stderrLine}`)
 					this.isStreamStuck = false
 				} else {
 					console.error(`OFFLINE ${this.nameStream}: ${this.stderrLine}`)
-					weNeedCheck = true
 				}
 			}
 		} else {
-			console.error(`NoTime${this.nameStream}: ${this.stderrLine}`)
-			if (this.stderrLine.includes(`ffmpeg exited`)) {
-				weNeedCheck = true
+			console.error(`NoTime ${this.nameStream}: ${this.stderrLine}`)
+			if (!this.isStreamStuck && Date.now() - this.lastFrameTime > 1000 * (this.stuckThreshold + 5)) {
+				console.log(`Stream ${this.nameStream} is done/error. Switching to backup.`)
+				this.isStreamStuck = true
+				this.startStream(this.backupUrl, true)
 			}
 		}
 
-		if (weNeedCheck) {
+		if (this.isStreamStuck) {
 			this.checkMainStream()
 		}
 	}
@@ -156,27 +157,34 @@ class StreamMonitor {
 						console.log(`stderr ${this.nameStream}: ${i}`)
 						const timeMatch = i.match(/time=\s*([\d:.]+)/)
 						if (timeMatch) {
-							if (this.ffCheck) this.ffCheck.kill("SIGINT")
+							try {
+								if (this.ffCheck) this.ffCheck.kill("SIGINT")
+							} catch (error) {
+								console.log(error)
+							}
+
+							const currentTime = timeMatch[1]
+							const currentMillis = this.timeToMillis(currentTime)
+							this.lastFrameTime = Date.now()
+							this.lastStreamTime = currentMillis
+
 							this.isStreamStuck = false
+
 							this.startStream(this.rtspUrl)
 							console.log(`Stream ${this.nameStream} main is back live`)
 						}
 
 						// Timeout wait load
-						//if(this.checkStreamInterval) clearInterval(this.checkStreamInterval)
-						//this.checkStreamInterval = setTimeout(() => {
-						//clearInterval(checkMainStreamInterval);
-						//checkMainStreamInterval = null;
-						//}, 1000 * 2);
+						if (this.checkStreamInterval) clearInterval(this.checkStreamInterval)
+						this.checkStreamInterval = setTimeout(() => {
+							clearInterval(this.checkMainStreamInterval)
+							this.checkMainStreamInterval = null
+						}, 1000 * 5)
 					})
 					.on("error", (i) => {
 						console.error(`Stream backup error: ${i.message}`)
 						clearInterval(this.checkMainStreamInterval)
 						this.checkMainStreamInterval = null
-						if (!i.message.includes("killed")) {
-							console.log(`Stream ${this.nameStream} for ${this.rtspUrl} not available yet: `, i)
-							this.isStreamStuck = true
-						}
 					})
 					.on("end", () => {
 						console.log(`Streaming check for ${this.nameStream} > backup ended`)
